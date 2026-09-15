@@ -1357,13 +1357,24 @@ function calculatePnL(){
     var buyQueue=[];
     stockTrades.forEach(function(t){
       if(t.direction==='buy'){
-        buyQueue.push({price:t.price,quantity:t.quantity,date:t.date,tradeId:t.id});
+        var buyQty=Number(t.quantity)||0;
+        buyQueue.push({
+          price:t.price,quantity:buyQty,date:t.date,tradeId:t.id,
+          /* 买入手续费折算为「每股费用」，便于部分卖出时按匹配数量精确分摊 */
+          feePerShare:buyQty>0?(Number(t.commission)||0)/buyQty:0
+        });
       }else{
-        var remaining=t.quantity;
+        var sellQty=Number(t.quantity)||0;
+        /* 卖出侧费用 = 佣金 + 印花税，同样折算每股，按匹配数量分摊 */
+        var sellFeePerShare=sellQty>0?((Number(t.commission)||0)+(Number(t.tax)||0))/sellQty:0;
+        var remaining=sellQty;
         while(remaining>0&&buyQueue.length>0){
           var buy=buyQueue[0];
           var matched=Math.min(remaining,buy.quantity);
-          var pnl=(t.price-buy.price)*matched-(t.commission||0)-(t.tax||0);
+          /* 已实现盈亏 = 价差收益 − 买入手续费分摊 − 卖出手续费/印花税分摊。
+             双边费用均按 matched 数量比例计入：既避免部分卖出时费用被整笔摊入，
+             也避免一笔卖出匹配多笔买入时费用被重复扣减 */
+          var pnl=(t.price-buy.price)*matched-buy.feePerShare*matched-sellFeePerShare*matched;
           results.push({
             stockCode:code,stockName:t.stockName,buyDate:buy.date,sellDate:t.date,
             buyPrice:buy.price,sellPrice:t.price,quantity:matched,pnl:pnl,
@@ -2016,7 +2027,9 @@ function renderClosedPositions(){
     }else{
       s.hasSell=true;
       s.sellQty+=(Number(t.quantity)||0);
-      s.sellAmt+=(Number(t.price)||0)*(Number(t.quantity)||0);
+      /* 卖出净额 = 卖出金额 − 佣金 − 印花税（与买入侧「价格×数量+佣金」口径对称，
+         确保已实现盈亏同时扣除买卖双边费用） */
+      s.sellAmt+=(Number(t.price)||0)*(Number(t.quantity)||0)-(Number(t.commission)||0)-(Number(t.tax)||0);
       if(!s.lastSellTs||ts>s.lastSellTs)s.lastSellTs=ts;
     }
   });
