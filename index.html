@@ -1411,6 +1411,46 @@ function calcHoldDays(dateStr){
   return Math.round((t0-t1)/(24*60*60*1000));
 }
 
+/* 判断交易日期是否为「今天」（本地自然日）。
+   用于区分当日买入的今仓与昨日结存仓位，两者当日盈亏的基准价不同 */
+function isTodayDate(dateStr){
+  var d=parseLocalDate(dateStr);
+  if(isNaN(d.getTime()))return false;
+  var n=new Date();
+  return d.getFullYear()===n.getFullYear()&&d.getMonth()===n.getMonth()&&d.getDate()===n.getDate();
+}
+
+/* 单只持仓的当日盈亏。
+   今仓与昨结必须分开算，否则当日买入的股票会拿「昨收」当基准，把买入前的涨跌也算进来：
+     · 昨结部分：(现价 − 昨收) × 昨结数量
+     · 今仓部分：(现价 − 当日买入均价) × 今仓数量    ← 当日买入均价含佣金，与「盈亏金额」口径一致
+   两者按 FIFO 拆分：当日卖出优先冲减昨结，昨结拆完才是今仓被卖。
+   返回 {has,amt}：has=false 表示缺少必要行情（昨结>0 却无昨收），调用方显示「—」 */
+function calcDayPnl(p,q){
+  if(!p||!q||!isFinite(q.f43))return {has:false,amt:0};
+  var qty=Math.max(0,Number(p.quantity)||0);
+  if(qty<=0)return {has:false,amt:0};
+  var buyQty=Math.min(Math.max(0,Number(p.todayBuyQty)||0),qty);  /* 今仓：当日买入且仍在持仓的部分 */
+  var beforeQty=qty-buyQty;                                       /* 昨结：剩余持仓中来自昨日及以前的部分 */
+  var preClose=parseFloat(q.f60);
+  var amt=0;
+  if(beforeQty>0){
+    /* 昨结部分依赖昨收；无昨收则不完整，整格显示「—」而不是只算一半 */
+    if(!isFinite(preClose)||preClose<=0)return {has:false,amt:0};
+    amt+=(q.f43-preClose)*beforeQty;
+  }
+  if(buyQty>0){
+    /* 当日买入均价 = 当日买入总额(含佣金) / 当日买入数量。
+       注意分母必须用「当日买入总量」而非「今仓剩余量」——当日买入后又卖出时两者不等，
+       拿剩余量当分母会把均价算高，导致当日盈亏反向虚亏 */
+    var buyTotalQty=Math.max(0,Number(p.todayBuyQty)||0);
+    var buyAvg=buyTotalQty>0?(Number(p.todayBuyCost)||0)/buyTotalQty:q.f43;
+    if(!isFinite(buyAvg))buyAvg=q.f43;
+    amt+=(q.f43-buyAvg)*buyQty;
+  }
+  return {has:true,amt:amt};
+}
+
 /* 交易按时间正序排列（同日按录入时间），返回副本不改原数组顺序。
    持仓聚合必须用时间序：trades 数组顺序是「录入/云同步合并顺序」，
    补录早期买入或合并乱序时，若直接遍历会出现"卖出先于买入被处理"，
@@ -1428,11 +1468,17 @@ function calculatePositions(){
   var stocks={};
   tradesChrono().forEach(function(t){
     if(!stocks[t.stockCode]){
-      stocks[t.stockCode]={code:t.stockCode,name:t.stockName,quantity:0,totalCost:0,firstDate:t.date};
+      /* todayBuyQty/todayBuyCost：当日买入的数量与成本（含佣金），供「当日盈亏」区分今仓与昨结 */
+      stocks[t.stockCode]={code:t.stockCode,name:t.stockName,quantity:0,totalCost:0,firstDate:t.date,todayBuyQty:0,todayBuyCost:0};
     }
+    var isToday=isTodayDate(t.date);
     if(t.direction==='buy'){
       stocks[t.stockCode].quantity+=t.quantity;
       stocks[t.stockCode].totalCost+=t.price*t.quantity+(t.commission||0);
+      if(isToday){
+        stocks[t.stockCode].todayBuyQty+=t.quantity;
+        stocks[t.stockCode].todayBuyCost+=t.price*t.quantity+(t.commission||0);
+      }
     }else{
       /* 摊薄成本法：卖出净额（卖出金额-佣金-印花税）直接冲减持仓总成本，剩余成本价随之下降。
          例：买1000股@10元（成本10000），卖500股@12元（净得6000）→ 剩余500股成本价=(10000-6000)/500=8元 */
@@ -1865,13 +1911,12 @@ function renderPositions(){
         pnlAmt='+¥'+(q.f43*p.quantity).toFixed(2);
       }
     }
-    /* 当日盈亏：与盈亏金额同口径（价格差 × 持仓量），价格差取「现价 − 昨收」 */
+    /* 当日盈亏：今仓按「现价 − 当日买入均价」、昨结按「现价 − 昨收」，避免当日买入被算成昨收的涨跌 */
     var dayPnl='—',dayPnlCls='';
-    var _preClose=parseFloat(q&&q.f60);
-    if(q&&isFinite(q.f43)&&isFinite(_preClose)&&_preClose>0){
-      var dayAmt=(q.f43-_preClose)*p.quantity;
-      dayPnlCls=dayAmt>=0?'profit':'loss';
-      dayPnl=(dayAmt>=0?'+':'')+'¥'+Math.abs(dayAmt).toFixed(2);
+    var _dayRes=calcDayPnl(p,q);
+    if(_dayRes.has){
+      dayPnlCls=_dayRes.amt>=0?'profit':'loss';
+      dayPnl=(_dayRes.amt>=0?'+':'')+'¥'+Math.abs(_dayRes.amt).toFixed(2);
     }
     return '<tr>'+
       '<td>'+p.code+'</td>'+
@@ -1912,13 +1957,12 @@ function renderPositions(){
         pnlAmtStr='+¥'+(q.f43*p.quantity).toFixed(2);
       }
     }
-    /* 当日盈亏：与盈亏金额同口径（价格差 × 持仓量），价格差取「现价 − 昨收」 */
+    /* 当日盈亏：今仓按「现价 − 当日买入均价」、昨结按「现价 − 昨收」，避免当日买入被算成昨收的涨跌 */
     var dayPnlStr='—',dayPnlCardCls='';
-    var _preClose2=parseFloat(q&&q.f60);
-    if(q&&isFinite(q.f43)&&isFinite(_preClose2)&&_preClose2>0){
-      var dayAmt2=(q.f43-_preClose2)*p.quantity;
-      dayPnlCardCls=dayAmt2>=0?'profit':'loss';
-      dayPnlStr=(dayAmt2>=0?'+':'')+'¥'+Math.abs(dayAmt2).toFixed(2);
+    var _dayRes2=calcDayPnl(p,q);
+    if(_dayRes2.has){
+      dayPnlCardCls=_dayRes2.amt>=0?'profit':'loss';
+      dayPnlStr=(_dayRes2.amt>=0?'+':'')+'¥'+Math.abs(_dayRes2.amt).toFixed(2);
     }
     return '<div class="trade-card">'+
       '<div class="trade-card-header">'+
@@ -1962,10 +2006,9 @@ function renderPositions(){
           var avgCost=p.quantity>0?p.totalCost/p.quantity:0;
           pnlSum+=(q.f43-avgCost)*p.quantity;
           pnlHas=true;
-          if(isFinite(q.f60)&&q.f60>0){
-            daySum+=(q.f43-q.f60)*p.quantity;
-            dayHas=true;
-          }
+          /* 当日盈亏：今仓按买入均价、昨结按昨收（同持仓表口径），无昨收则不计入 */
+          var _dp=calcDayPnl(p,q);
+          if(_dp.has){daySum+=_dp.amt;dayHas=true;}
         }
       });
       if(pnlHas){
